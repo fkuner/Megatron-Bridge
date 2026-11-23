@@ -552,6 +552,24 @@ class TestHybridTransformerParity:
 
         assert hybrid_flops == pytest.approx(transformer_flops)
 
+    @pytest.mark.parametrize("mtp_depth", [1, 2])
+    def test_mtp_physical_pattern_matches_transformer(self, mtp_depth):
+        """Hybrid MTP must include the same projection/norm work as GPT MTP."""
+        transformer_cfg = MockConfigContainer(model=MockModelConfig(**self._base_config(mtp_num_layers=mtp_depth)))
+        hybrid_cfg = MockConfigContainer(
+            model=MockModelConfig(
+                **self._base_config(
+                    is_hybrid_model=True,
+                    num_layers=8,
+                    hybrid_layer_pattern="*-" * 4 + "/*-" * mtp_depth,
+                    mtp_num_layers=mtp_depth,
+                )
+            )
+        )
+        assert num_floating_point_operations(hybrid_cfg, batch_size=2) == pytest.approx(
+            num_floating_point_operations(transformer_cfg, batch_size=2)
+        )
+
     def test_moe_physical_pattern_matches_transformer(self):
         """GPT-OSS-style attention+MoE physical layers should not double-count FLOPs."""
         batch_size = 2
@@ -1430,8 +1448,8 @@ class TestDeepSeekV4HybridFlops:
 class TestHybridMtpPatternParsing:
     """Tests for hybrid/MTP pattern parsing in FLOPs accounting."""
 
-    def test_inferred_mtp_depth_scales_hybrid_logit_flops(self):
-        """When mtp_num_layers is inferred from parsed pattern, logits FLOPs should scale accordingly."""
+    def test_inferred_mtp_depth_scales_hybrid_auxiliary_flops(self):
+        """Inferred MTP depth scales its projection, normalization, and output heads."""
         batch_size = 1
         seq_len = 256
         hidden_size = 1024
@@ -1462,11 +1480,12 @@ class TestHybridMtpPatternParsing:
             flops_explicit_zero = num_floating_point_operations(cfg_explicit_zero, batch_size=batch_size)
             flops_inferred = num_floating_point_operations(cfg_inferred, batch_size=batch_size)
 
-        # Only the logits term should differ here:
-        #   delta = 2 * B * S * H * vocab * inferred_mtp_num_layers, then *3 for fwd+bwd factor.
-        expected_delta = 2 * batch_size * seq_len * hidden_size * vocab_size * 2 * 3
+        # Pattern counts are identical; only MTP projections/norms and output heads differ.
+        expected_delta = (
+            6 * batch_size * seq_len * 2 * (hidden_size * vocab_size + 3 * hidden_size + 2 * hidden_size**2)
+        )
         actual_delta = flops_inferred - flops_explicit_zero
-        assert actual_delta == expected_delta, f"Expected logits delta {expected_delta:.2e} but got {actual_delta:.2e}"
+        assert actual_delta == expected_delta
 
 
 @pytest.mark.unit

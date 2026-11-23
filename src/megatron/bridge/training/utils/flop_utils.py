@@ -1198,6 +1198,8 @@ def num_floating_point_operations(
                 gdn_use_gdn2,
             )
             + kda_flops
+            # MTP embedding/hidden projection and norms, beyond the pattern's attention/MLP.
+            + 2 * batch_size * seq_len * mtp_num_layers * (3 * hidden_size + 2 * hidden_size**2)
             + (2 * batch_size * seq_len * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
         )
         return flops_fwd * 3
@@ -1969,11 +1971,6 @@ def num_floating_point_operations(
             if dsv4_ratios:
                 attention_term, attention_core_term = dsv4_attention_terms(dsv4_ratios)
                 llm_flops += seqlen_sum * attention_term + effective_seqlen_squared_sum * attention_core_term
-                # MTP norms and embedding/hidden projection; its attention,
-                # MoE and logits are already counted from the unified pattern.
-                llm_flops += (
-                    seqlen_sum * 3 * 2 * mtp_num_layers * (3 * cfg.model.hidden_size + 2 * cfg.model.hidden_size**2)
-                )
         return llm_flops + _compute_vit_flops()
     else:
         # Compute standard Transformer model FLOPs.
