@@ -5382,12 +5382,11 @@ class TestFSDPDTensorFunctionality:
         mock_optimizer.sharded_state_dict.assert_called_once()
 
     @pytest.mark.parametrize("ckpt_format", ["torch_dist", "fsdp_dtensor"])
-    @pytest.mark.parametrize(
-        "is_loading,has_rng_scaffold,expected_rng_state",
-        [(True, True, True), (True, False, False), (False, True, False)],
-    )
+    @pytest.mark.parametrize("save_rng", [False, True])
+    @pytest.mark.parametrize("is_loading", [False, True])
+    @pytest.mark.parametrize("has_rng_scaffold", [False, True])
     def test_generate_state_dict_includes_rng_scaffold_only_when_loading(
-        self, ckpt_format, is_loading, has_rng_scaffold, expected_rng_state
+        self, ckpt_format, save_rng, is_loading, has_rng_scaffold
     ):
         """Load-time RNG scaffolding should not depend on save_rng."""
         from megatron.bridge.training.checkpointing import generate_state_dict
@@ -5398,7 +5397,7 @@ class TestFSDPDTensorFunctionality:
         mock_rng_state = Mock() if has_rng_scaffold else None
         optim_sd_kwargs = {"is_loading": True} if is_loading else None
 
-        ckpt_cfg = CheckpointConfig(ckpt_format=ckpt_format, save_rng=False)
+        ckpt_cfg = CheckpointConfig(ckpt_format=ckpt_format, save_rng=save_rng)
         result = generate_state_dict(
             ckpt_cfg=ckpt_cfg,
             model=[mock_model],
@@ -5408,6 +5407,7 @@ class TestFSDPDTensorFunctionality:
             optim_sd_kwargs=optim_sd_kwargs,
         )
 
+        expected_rng_state = has_rng_scaffold if is_loading else save_rng
         assert ("rng_state" in result) is expected_rng_state
         if expected_rng_state:
             assert result["rng_state"] is mock_rng_state

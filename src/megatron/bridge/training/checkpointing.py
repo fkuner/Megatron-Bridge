@@ -2274,7 +2274,7 @@ def generate_state_dict(
         state_dict["rerun_state_machine"] = rerun_state
 
     # RNG states.
-    if ckpt_cfg.save_rng or (is_loading and rng_state is not None):
+    if (is_loading and rng_state is not None) or (not is_loading and ckpt_cfg.save_rng):
         state_dict["rng_state"] = rng_state
 
     return state_dict

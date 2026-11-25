@@ -1,4 +1,5 @@
 import importlib
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -6,6 +7,7 @@ import torch
 from megatron.core.transformer.enums import AttnBackend
 
 from megatron.bridge.models.bailing.bailing_moe3_bridge import BailingMoeV3Bridge
+from megatron.bridge.training.config import apply_environment_variables
 from tests.unit_tests.models.bailing.test_bailing_moe3_bridge import _flash_config, requires_ling_mcore
 
 
@@ -54,7 +56,7 @@ def test_flash_sft_recipe_preserves_architecture_and_fsdp_contract(monkeypatch, 
     assert cfg.model.pipeline_model_parallel_size == cfg.model.tensor_model_parallel_size == 1
     assert cfg.model.context_parallel_size == cfg.model.expert_tensor_parallel_size == 1
     assert cfg.model.attention_backend == AttnBackend.auto
-    assert cfg.model.expert_model_parallel_size == 8
+    assert cfg.model.expert_model_parallel_size == 16
     assert cfg.ddp.use_megatron_fsdp and cfg.ddp.megatron_fsdp_version == 1
     assert (
         cfg.ddp.data_parallel_sharding_strategy
@@ -63,6 +65,11 @@ def test_flash_sft_recipe_preserves_architecture_and_fsdp_contract(monkeypatch, 
     )
     assert cfg.ddp.megatron_fsdp_main_params_dtype == cfg.ddp.megatron_fsdp_main_grads_dtype == torch.float32
     assert cfg.checkpoint.ckpt_format == "fsdp_dtensor"
+    assert cfg.checkpoint.strict_fsdp_dtensor_load is True
+    assert cfg.checkpoint.load_rng is True
+    assert cfg.checkpoint.save_rng is True
+    assert cfg.checkpoint.save_optim is True
+    assert cfg.checkpoint.load_optim is True
     assert cfg.checkpoint.save_interval == 50
     assert cfg.train.global_batch_size == 128 and cfg.train.micro_batch_size == 2
     assert cfg.train.train_iters == 100
@@ -70,8 +77,22 @@ def test_flash_sft_recipe_preserves_architecture_and_fsdp_contract(monkeypatch, 
     assert cfg.dataset.enable_offline_packing is False
     assert cfg.dataset.dataset_kwargs["pad_to_max_length"] is True
     assert cfg.model.mtp_loss_scaling_factor == 0.1
-    assert cfg.model.bias_activation_fusion is False
+    assert cfg.model.bias_activation_fusion is True
+    assert cfg.model.gradient_accumulation_fusion is False
+    assert cfg.ddp.suggested_communication_unit_size is None
     assert cfg.env_vars["CUDA_DEVICE_MAX_CONNECTIONS"] != "1"
+    assert cfg.env_vars["NVTE_USE_CUTLASS_GROUPED_GEMM"] == "1"
+    assert cfg.env_vars["NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK"] == "0"
+
+    for name in cfg.env_vars:
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+    apply_environment_variables(cfg)
+    assert os.environ["NVTE_USE_CUTLASS_GROUPED_GEMM"] == "1"
+    assert os.environ["NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK"] == "0"
+    monkeypatch.setenv("NVTE_USE_CUTLASS_GROUPED_GEMM", "0")
+    apply_environment_variables(cfg)
+    assert os.environ["NVTE_USE_CUTLASS_GROUPED_GEMM"] == "0"
 
     # Finalization must retain the complete HF architecture, including MTP.
     cfg.model.finalize()
@@ -80,7 +101,15 @@ def test_flash_sft_recipe_preserves_architecture_and_fsdp_contract(monkeypatch, 
     assert "|" not in main_pattern and mtp_pattern == "+E"
     assert cfg.model.q_lora_rank is None
     assert cfg.model.init_model_with_meta_device
-    assert cfg.model.moe_token_dispatcher_type == "alltoall"
+    assert (cfg.model.moe_token_dispatcher_type, cfg.model.moe_flex_dispatcher_backend) == ("flex", "hybridep")
+    assert cfg.model.moe_flex_dispatcher_num_sms == 8
+    assert cfg.model.moe_hybridep_num_sms is None
+    assert cfg.model.moe_deepep_num_sms is None
+    assert cfg.model.moe_permute_fusion is True
+    assert cfg.model.moe_router_fusion is True
+    assert cfg.model.moe_permute_fusion_into_hybridep is False
+    assert cfg.model.moe_expert_capacity_factor is None
+    assert cfg.model.moe_expert_rank_capacity_factor is None
     assert (cfg.model.recompute_granularity, cfg.model.recompute_method, cfg.model.recompute_num_layers) == (
         "full",
         "uniform",

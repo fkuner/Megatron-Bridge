@@ -939,7 +939,7 @@ def test_kda_conv_mapping_preserves_semantic_sections_under_tp() -> None:
         assert torch.equal(exported[name], source[name])
 
 
-@pytest.mark.parametrize("limit", [4.0, 5.0, 7.0])
+@pytest.mark.parametrize("limit", [4.0, 5.0, 7.0, pytest.param(4.0, id="4.0-reuse")])
 def test_post_silu_clamp_forward_and_analytic_backward(limit):
     # Include a gate above L whose SiLU is below L: pre-SiLU clipping fails here.
     gate = torch.tensor([-12.0, -1.0, 0.0, limit + 0.01, limit + 1.0, 12.0], dtype=torch.float64)
@@ -972,24 +972,66 @@ def _capture(**kwargs):
         (2, True, None, None),
     ],
 )
-def test_clipping_uses_logical_layer_and_excludes_mtp(physical_layer, mtp, expert_limit, shared_limit):
+@pytest.mark.parametrize("bias_activation_fusion", [False, True])
+def test_clipping_uses_logical_layer_and_excludes_mtp(
+    physical_layer, mtp, expert_limit, shared_limit, bias_activation_fusion
+):
     native_experts = partial(_capture, submodules=SimpleNamespace(activation_func=None))
     native_shared = partial(_capture, submodules=SimpleNamespace(activation_func=None))
     native = partial(_capture, submodules=SimpleNamespace(experts=native_experts, shared_experts=native_shared))
+    config = SimpleNamespace(
+        bias_activation_fusion=bias_activation_fusion,
+        use_transformer_engine_op_fuser=False,
+        activation_func_clamp_value=None,
+        use_te_activation_func=False,
+    )
     result = build_bailing_moe3_moe(
         builder=native,
         expert_limits=[0] * 35 + [4] * 7,
         shared_limits=[0] * 34 + [5] * 6 + [7] * 2,
         layer_number=physical_layer,
         is_mtp_layer=mtp,
-        config=SimpleNamespace(),
+        config=config,
     )
     assert result["layer_number"] == physical_layer
     for name, expected in (("experts", expert_limit), ("shared_experts", shared_limit)):
-        assert getattr(result["submodules"], name).keywords.get("limit") == expected
+        branch = getattr(result["submodules"], name)
+        assert branch.keywords.get("limit") == expected
+        extra = {"num_local_experts": 2} if name == "experts" else {}
+        built = branch(config=config, **extra)
+        if expected is None:
+            assert built["config"] is config
+            assert built["config"].bias_activation_fusion is bias_activation_fusion
+            assert built["submodules"].activation_func is None
+        else:
+            assert built["config"] is not config
+            assert built["config"].bias_activation_fusion is False
+            assert built["config"].use_te_activation_func is True
+            assert built["submodules"].activation_func.keywords["limit"] == expected
+        assert config.bias_activation_fusion is bias_activation_fusion
+        assert config.use_te_activation_func is False
     # A later layer must never mutate the reusable native spec.
     assert native.keywords["submodules"].experts is native_experts
     assert native_experts.keywords["submodules"].activation_func is None
+    assert native_shared.keywords["submodules"].activation_func is None
+
+
+@pytest.mark.parametrize(
+    "op_fusion,native_clamp,message",
+    [(True, None, "disabling TE operation fusion"), (False, 4.0, "pre-SiLU clamp")],
+)
+def test_clipped_activation_rejects_incompatible_fusion(op_fusion, native_clamp, message):
+    config = SimpleNamespace(
+        bias_activation_fusion=True,
+        use_transformer_engine_op_fuser=op_fusion,
+        activation_func_clamp_value=native_clamp,
+        use_te_activation_func=False,
+    )
+    builder = partial(_capture, submodules=SimpleNamespace(activation_func=None))
+    with pytest.raises(ValueError, match=message):
+        _build_clamped_mlp(builder=builder, limit=4.0, config=config)
+    assert config.bias_activation_fusion is True
+    assert config.use_te_activation_func is False
 
 
 @pytest.mark.parametrize("limits", [[0] * 41, [0] * 41 + [-1], [0] * 41 + [float("nan")]])
@@ -1044,6 +1086,20 @@ def _compare(actual, reference, name):
     assert similarity >= 0.999, (name, similarity)
 
 
+def _compare_bf16_activation(actual, reference, name):
+    assert torch.isfinite(actual).all(), name
+    assert torch.isfinite(reference).all(), name
+    actual, reference = actual.detach().double().flatten(), reference.detach().double().flatten()
+    denominator = (actual.square() + reference.square()).sum()
+    if denominator == 0:
+        return
+    cosine = F.cosine_similarity(actual, reference, dim=0).item()
+    similarity = (2 * (actual * reference).sum() / denominator).item()
+    logger.info("%s cosine=%.9f tensor_similarity=%.9f", name, cosine, similarity)
+    assert cosine >= 0.999, (name, cosine)
+    assert similarity >= 0.999, (name, similarity)
+
+
 @pytest.mark.run_only_on("GPU")
 class TestBailingMoe3NativeModules:
     """Check native construction and TE outputs/gradients with Flash expert dimensions."""
@@ -1082,8 +1138,9 @@ class TestBailingMoe3NativeModules:
         "layer_number,is_mtp,routed,shared",
         [(70, False, None, 5), (72, False, 4, 5), (84, False, 4, 7), (2, True, None, None)],
     )
+    @pytest.mark.parametrize("bias_activation_fusion", [False, True])
     def test_native_layer_binds_limits_before_building_experts(
-        self, native_groups, layer_number, is_mtp, routed, shared
+        self, native_groups, layer_number, is_mtp, routed, shared, bias_activation_fusion
     ):
         from megatron.core.transformer.spec_utils import build_module
 
@@ -1102,7 +1159,7 @@ class TestBailingMoe3NativeModules:
             gated_linear_unit=True,
             activation_func=F.silu,
             add_bias_linear=False,
-            bias_activation_fusion=False,
+            bias_activation_fusion=bias_activation_fusion,
             gradient_accumulation_fusion=False,
             init_model_with_meta_device=True,
             expert_swiglu_limit_list=[0] * 35 + [4] * 7,
@@ -1120,15 +1177,20 @@ class TestBailingMoe3NativeModules:
                 pg_collection=native_groups,
             )
         assert all(parameter.is_meta for parameter in layer.parameters())
+        assert config.bias_activation_fusion is bias_activation_fusion
         for module, expected in ((layer.mlp.experts, routed), (layer.mlp.shared_experts, shared)):
             if expected is None:
                 assert not isinstance(module.activation_func, BailingMoe3ClampedSwiGLU)
+                assert module.config.bias_activation_fusion is bias_activation_fusion
             else:
                 assert isinstance(module.activation_func, BailingMoe3ClampedSwiGLU)
                 assert module.activation_func.limit == expected
+                assert module.config.bias_activation_fusion is False
+                assert module.config.use_te_activation_func is True
 
     @pytest.mark.parametrize("kind,limit", [("experts", 4.0), ("shared_experts", 5.0), ("shared_experts", 7.0)])
-    def test_native_te_clipped_expert_output_and_gradients(self, native_groups, kind, limit):
+    @pytest.mark.parametrize("bias_activation_fusion", [False, True])
+    def test_native_te_clipped_expert_output_and_gradients(self, native_groups, kind, limit, bias_activation_fusion):
         from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
         from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -1144,7 +1206,7 @@ class TestBailingMoe3NativeModules:
             gated_linear_unit=True,
             activation_func=F.silu,
             add_bias_linear=False,
-            bias_activation_fusion=False,
+            bias_activation_fusion=bias_activation_fusion,
             gradient_accumulation_fusion=False,
             params_dtype=torch.float32,
             use_cpu_initialization=False,
@@ -1196,3 +1258,75 @@ class TestBailingMoe3NativeModules:
         for name, param in module.named_parameters():
             assert param.grad is not None, name
             _compare(param.grad, weights[name].grad, name)
+
+    @pytest.mark.parametrize("limit", [4.0, 5.0, 7.0])
+    @pytest.mark.parametrize("weighted", [False, True])
+    def test_jit_clipped_swiglu_bf16_output_and_gradients(self, native_groups, limit, weighted):
+        # Independent reference: inclusionAI/SGLang BailingMLP at
+        # 822e3e2dd1bb236f5223d205aa4dcae91c8b3d40, post-SiLU gate clamp.
+        # Keep Flash's expert width; cover saturation and both sides of the
+        # BF16-representable clipping boundaries, including exact up boundaries.
+        torch.manual_seed(1234)
+        values = (6 * torch.randn(256, 2 * 768, device="cuda")).bfloat16()
+        edges = torch.tensor(
+            [
+                -20,
+                -limit - 0.125,
+                -limit,
+                -limit + 0.125,
+                -1,
+                0,
+                1,
+                limit - 0.0625,
+                limit,
+                limit + 0.03125,
+                limit + 0.0625,
+                limit + 0.125,
+                limit + 1,
+                20,
+            ],
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        values[0, : edges.numel()] = edges
+        values[0, 768 : 768 + edges.numel()] = edges.flip(0)
+        inputs = values.detach().requires_grad_()
+        reference_inputs = values.float().requires_grad_()
+        eager_inputs = values.detach().clone().requires_grad_()
+        probabilities = torch.linspace(0.01, 0.99, values.shape[0], device="cuda").requires_grad_()
+        reference_probabilities = probabilities.detach().clone().requires_grad_()
+        eager_probabilities = probabilities.detach().clone().requires_grad_()
+
+        activation = BailingMoe3ClampedSwiGLU(config=None, limit=limit)
+        with torch.no_grad():
+            checkpoint_output = activation(values)
+        output = activation(inputs)
+        _compare_bf16_activation(checkpoint_output, output, "checkpoint/recompute activation")
+        gate, up = reference_inputs.chunk(2, dim=-1)
+        activated = gate * torch.sigmoid(gate)
+        activated = torch.where(activated > limit, limit, activated)
+        clipped_up = torch.where(up > limit, limit, torch.where(up < -limit, -limit, up))
+        expected = activated * clipped_up
+        eager_gate, eager_up = eager_inputs.chunk(2, dim=-1)
+        eager = F.silu(eager_gate).clamp(max=limit) * eager_up.clamp(-limit, limit)
+        if weighted:
+            # TEGroupedMLP applies FP32 router probabilities after activation,
+            # then casts back to the activation dtype before the second GEMM.
+            output = (output * probabilities.unsqueeze(-1)).to(inputs.dtype)
+            eager = (eager * eager_probabilities.unsqueeze(-1)).to(inputs.dtype)
+            expected = expected * reference_probabilities.unsqueeze(-1)
+        upstream = torch.randn_like(output)
+        (output * upstream).sum().backward()
+        (eager * upstream).sum().backward()
+        (expected * upstream.float()).sum().backward()
+        for name, expected_output, expected_inputs in (
+            ("FP32 reference", expected, reference_inputs),
+            ("BF16 eager", eager, eager_inputs),
+        ):
+            _compare_bf16_activation(output, expected_output, name + " output")
+            _compare_bf16_activation(inputs.grad, expected_inputs.grad, name + " input gradient")
+        if weighted:
+            _compare_bf16_activation(
+                probabilities.grad, reference_probabilities.grad, "FP32 reference probability gradient"
+            )
+            _compare_bf16_activation(probabilities.grad, eager_probabilities.grad, "BF16 eager probability gradient")

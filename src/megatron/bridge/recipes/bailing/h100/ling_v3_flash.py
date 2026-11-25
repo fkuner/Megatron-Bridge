@@ -29,13 +29,15 @@ LING_V3_FLASH_HF_REVISION = "fcc60a52b34c69c6271d0ac8a8cb0815020b6a43"  # pragma
 
 
 def ling_v3_flash_sft_64gpu_h100_bf16_config() -> ConfigContainer:
-    """Full-parameter SFT with EP8, m-FSDP v1, and TP=PP=CP=ETP=1.
+    """Full-parameter SFT with EP16, HybridEP, m-FSDP v1, and TP=PP=CP=ETP=1.
 
-    Dense parameters shard across 64 ranks and expert parameters across eight
+    Dense parameters shard across 64 ranks and expert parameters across four
     expert-DP ranks. Model construction reads the HF configuration only. Set
     LING_V3_FLASH_HF_PATH for a local snapshot and pass --pretrained_checkpoint
-    to run_recipe.py to initialize weights from HF or a compatible fsdp_dtensor
-    checkpoint. The full 42-block architecture and MTP layer are preserved.
+    to run_recipe.py to initialize weights from HF. Weight-only fsdp_dtensor
+    initialization requires a separate RNG-load fix. The full 42-block
+    architecture and MTP layer are preserved.
+    Requires HybridEP and Transformer Engine with CUTLASS grouped GEMM support.
     """
     cfg = _sft_common()
     hf_path = os.environ.get("LING_V3_FLASH_HF_PATH", LING_V3_FLASH_HF_MODEL)
@@ -53,16 +55,20 @@ def ling_v3_flash_sft_64gpu_h100_bf16_config() -> ConfigContainer:
     cfg.model.pipeline_model_parallel_layout = None
     cfg.model.virtual_pipeline_model_parallel_size = None
     cfg.model.context_parallel_size = 1
-    cfg.model.expert_model_parallel_size = 8
+    cfg.model.expert_model_parallel_size = 16
     cfg.model.expert_tensor_parallel_size = 1
     cfg.model.sequence_parallel = False
     cfg.model.init_model_with_meta_device = True
     cfg.model.seq_length = 4096
     cfg.model.transformer_impl = "transformer_engine"
-    cfg.model.moe_token_dispatcher_type = "alltoall"
+    cfg.model.moe_token_dispatcher_type = "flex"
+    cfg.model.moe_flex_dispatcher_backend = "hybridep"
+    cfg.model.moe_flex_dispatcher_num_sms = 8
+    cfg.model.moe_permute_fusion = True
+    cfg.model.moe_router_fusion = True
     cfg.model.moe_shared_expert_overlap = False
     cfg.model.mtp_loss_scaling_factor = 0.1
-    cfg.model.bias_activation_fusion = False
+    cfg.model.bias_activation_fusion = True
     cfg.model.gradient_accumulation_fusion = False
     cfg.model.use_transformer_engine_op_fuser = False
     cfg.model.fp8 = None
@@ -90,6 +96,7 @@ def ling_v3_flash_sft_64gpu_h100_bf16_config() -> ConfigContainer:
     cfg.scheduler.lr_warmup_iters = 10
     cfg.scheduler.lr_decay_iters = 100
     cfg.checkpoint.ckpt_format = "fsdp_dtensor"
+    cfg.checkpoint.strict_fsdp_dtensor_load = True
     cfg.checkpoint.save_interval = 50
     cfg.checkpoint.fully_parallel_save = False
     cfg.validation.eval_interval = 50
@@ -98,6 +105,8 @@ def ling_v3_flash_sft_64gpu_h100_bf16_config() -> ConfigContainer:
         **COMMON_RECIPE_ENV_VARS,
         "CUDA_DEVICE_MAX_CONNECTIONS": "32",
         "NVIDIA_TF32_OVERRIDE": "0",
+        "NVTE_USE_CUTLASS_GROUPED_GEMM": "1",
+        "NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK": "0",
     }
     return cfg
 

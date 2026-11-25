@@ -23,6 +23,7 @@ from functools import partial
 import torch
 import torch.nn.functional as F
 from megatron.core.extensions.transformer_engine import TENorm
+from megatron.core.jit import jit_fuser
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.transformer import ModuleSpec
@@ -42,6 +43,15 @@ def validate_swiglu_limits(limits: Sequence[float] | None, *, num_layers: int, f
     return list(limits)
 
 
+@jit_fuser
+def _clamped_swiglu(inputs: torch.Tensor, limit: float) -> torch.Tensor:
+    """Fuse Ling post-SiLU clipping while retaining its activation order."""
+    gate, up = inputs.chunk(2, dim=-1)
+    # Tensor bounds retain the runtime value when the compiler generalizes limits across layers.
+    bound = torch.scalar_tensor(limit, dtype=inputs.dtype, device=inputs.device)
+    return F.silu(gate).clamp(max=bound) * up.clamp(min=-bound, max=bound)
+
+
 class BailingMoe3ClampedSwiGLU(torch.nn.Module):
     """Apply ``clamp(silu(gate), max=L) * clamp(up, -L, L)``.
 
@@ -57,17 +67,18 @@ class BailingMoe3ClampedSwiGLU(torch.nn.Module):
         self.limit = limit
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        gate, up = inputs.chunk(2, dim=-1)
-        return F.silu(gate).clamp(max=self.limit) * up.clamp(min=-self.limit, max=self.limit)
+        return _clamped_swiglu(inputs, self.limit)
 
 
 def _build_clamped_mlp(*, builder, limit: float, config, **kwargs):
     """Change only the activation slot in an existing native MCore builder."""
-    if config.bias_activation_fusion or config.use_transformer_engine_op_fuser:
-        raise ValueError("Ling post-SiLU clipping requires unfused activations (disable activation/op fusion).")
+    if config.use_transformer_engine_op_fuser:
+        raise ValueError("Ling post-SiLU clipping requires disabling TE operation fusion.")
     if config.activation_func_clamp_value is not None:
         raise ValueError("Ling post-SiLU clipping cannot be combined with MCore's pre-SiLU clamp.")
     config = copy.copy(config)
+    # Keep native SwiGLU fusion on unclipped siblings; clipped branches use the custom JIT activation.
+    config.bias_activation_fusion = False
     config.use_te_activation_func = True
     submodules = copy.deepcopy(builder.keywords["submodules"])
     submodules.activation_func = partial(BailingMoe3ClampedSwiGLU, limit=limit)
